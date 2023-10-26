@@ -7,7 +7,8 @@ param (
     [string]$BuildDir = 'C:\tiny11',
     [string]$Output = (Join-Path $PSScriptRoot 'tiny11.iso'),
     [int]$MaxRegOperationAttempts = 100,
-    [int]$MaxImageOperationAttempts = 10
+    [int]$MaxImageOperationAttempts = 10,
+    [switch]$Cleanup
 )
 begin {
     Push-Location $PSScriptRoot -StackName Tiny11Creator
@@ -213,9 +214,73 @@ begin {
         if ($Counter -gt $MaxImageOperationAttempts) { return $false }
         return $true
     }
+
+    function DoCleanup {
+        Write-Host -ForegroundColor Cyan "`nPerforming cleanup..."
+        $Dirty = $false
+        [System.GC]::Collect()
+
+        Write-Host -ForegroundColor Cyan "`nLooking for loaded registry keys from image..."
+        if (-not (UnmountRegKey 'HKLM:\tiny11_DEFAULT')) { $Dirty = $true }
+        if (-not (UnmountRegKey 'HKLM:\tiny11_SOFTWARE')) { $Dirty = $true }
+        if (-not (UnmountRegKey 'HKLM:\tiny11_SYSTEM')) { $Dirty = $true }
+        if (-not (UnmountRegKey 'HKLM:\tiny11_USERDEFAULT')) { $Dirty = $true }
+
+        Write-Host -ForegroundColor Cyan "`nCleanup scratch directory..."
+        if (-not (UnmountImage $ScratchDir)) { $Dirty = $true }
+
+        if (Test-Path -PathType Container $ScratchDir) {
+            $Dirty = $true
+            Write-Warning "Couldn't clean up scratch directory '$ScratchDir'. You may have to manually remove remaining temporary files."
+        }
+
+        Write-Host -ForegroundColor Cyan "`nCleanup build directory..."
+        $Counter = 0
+        while ((Test-Path $BuildDir) -and $Counter -lt $MaxImageOperationAttempts) {
+            Remove-Item $BuildDir -Force -Recurse -ErrorAction:SilentlyContinue
+            Start-Sleep 2
+            $Counter++
+        }
+        if ($Counter -ge $MaxImageOperationAttempts) { $Dirty = $true }
+
+        if (Test-Path -PathType Container $BuildDir) {
+            $Dirty = $true
+            Write-Warning "Couldn't clean up build directory '$BuildDir'. You may have to manually remove remaining temporary files."
+        }
+
+        Write-Host -ForegroundColor Cyan "`nLooking for mounted source ISO..."
+        if (-not (UnmountIso $Source)) { $Dirty = $true }
+
+        if ($Dirty) {
+            Write-Host -ForegroundColor Red 'Cleanup was incomplete. Try running the script in cleanup mode:'
+            Write-Host -ForegroundColor White "$(Join-Path $PSScriptRoot 'Tiny11Creator.ps1') -Source ""$Source"" -ScratchDir ""$ScratchDir"" -BuildDir ""$BuildDir"" -Cleanup"
+            Write-Host -ForegroundColor Magenta "`n`nOther commands that may help in cleaning up manually:"
+            Write-Host -ForegroundColor White '    reg.exe unload HKLM\tiny11_DEFAULT'
+            Write-Host -ForegroundColor Gray '    reg.exe unload HKLM\tiny11_SOFTWARE'
+            Write-Host -ForegroundColor White '    reg.exe unload HKLM\tiny11_SYSTEM'
+            Write-Host -ForegroundColor Gray '    reg.exe unload HKLM\tiny11_USERDEFAULT'
+            Write-Host -ForegroundColor White "    dism.exe /Unmount-Image /MountDir:""$ScratchDir"" /Discard"
+            Write-Host -ForegroundColor Gray '    dism.exe /Cleanup-MountPoints'
+            Write-Host -ForegroundColor White "    powershell.exe -c Remove-Item ""$ScratchDir"" -Force -Recurse"
+            Write-Host -ForegroundColor Gray "    powershell.exe -c ""$BuildDir"" -Force -Recurse"
+        } else {
+            Write-Host -ForegroundColor Green "`nCleanup complete. Finished."
+        }
+        Write-Host -ForegroundColor Magenta "`n`nPress Enter to exit the script..."
+        $null = Read-Host
+
+        Pop-Location -StackName Tiny11Creator
+        $Host.UI.RawUI.WindowTitle = $OldTitle
+
+        $script:DidCleanup = $true
+    }
 }
 
 process {
+    if ($Cleanup) {
+        DoCleanup
+        return
+    }
     try {
         :ProcessSection
         while ($true) {
@@ -455,9 +520,11 @@ process {
         }
     } catch {
         Write-Host -ForegroundColor Red 'Script failed or was terminated'
+    } finally {
+        DoCleanup
     }
 }
+
 end {
-    $Host.UI.RawUI.WindowTitle = $OldTitle
-    Pop-Location -StackName Tiny11Creator
+    if (-not $script:DidCleanup) { DoCleanup }
 }
