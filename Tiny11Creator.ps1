@@ -125,6 +125,86 @@ begin {
         }
     )
 
+    $RegHives = @{
+        'HKLM' = [Microsoft.Win32.Registry]::LocalMachine
+        'HKCU' = [Microsoft.Win32.Registry]::CurrentUser
+        'HKU'  = [Microsoft.Win32.Registry]::Users
+        'HKCC' = [Microsoft.Win32.Registry]::CurrentConfig
+        'HKCR' = [Microsoft.Win32.Registry]::ClassesRoot
+        'HKPD' = [Microsoft.Win32.Registry]::PerformanceData
+    }
+
+    $MaxRegAttemptsStrLen = $MaxRegOperationAttempts.ToString().Length + 1
+    $MaxImageAttemptsStrLen = $MaxImageOperationAttempts.ToString().Length + 1
+    $script:DidCleanup = $false
+
+    # Adapted from https://social.technet.microsoft.com/Forums/en-US/e718a560-2908-4b91-ad42-d392e7f8f1ad/take-ownership-of-a-registry-key-and-change-permissions?forum=winserverpowershell
+    function Enable-Privilege {
+        param(
+            # One of the text enums from: https://learn.microsoft.com/en-gb/windows/win32/secauthz/privilege-constants
+            [string]$Privilege,
+            [switch]$Disable
+        )
+
+        # Originally from pinvoke.net
+        $Definition = @'
+using System;
+using System.Runtime.InteropServices;
+
+public class AdjPriv
+{
+    [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
+    internal static extern bool AdjustTokenPrivileges(IntPtr htok, bool disall,
+        ref TokPriv1Luid newst, int len, IntPtr prev, IntPtr relen);
+
+    [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
+    internal static extern bool OpenProcessToken(IntPtr h, int acc, ref IntPtr phtok);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    internal static extern bool LookupPrivilegeValue(string host, string name, ref long pluid);
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    internal struct TokPriv1Luid
+    {
+        public int Count;
+        public long Luid;
+        public int Attr;
+    }
+
+    internal const int SE_PRIVILEGE_ENABLED = 0x00000002;
+    internal const int SE_PRIVILEGE_DISABLED = 0x00000000;
+    internal const int TOKEN_QUERY = 0x00000008;
+    internal const int TOKEN_ADJUST_PRIVILEGES = 0x00000020;
+    public static bool EnablePrivilege(long processHandle, string privilege, bool disable)
+    {
+        bool retVal;
+        TokPriv1Luid tp;
+        IntPtr hproc = new IntPtr(processHandle);
+        IntPtr htok = IntPtr.Zero;
+        retVal = OpenProcessToken(hproc, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ref htok);
+        tp.Count = 1;
+        tp.Luid = 0;
+        if(disable)
+        {
+            tp.Attr = SE_PRIVILEGE_DISABLED;
+        }
+        else
+        {
+            tp.Attr = SE_PRIVILEGE_ENABLED;
+        }
+        retVal = LookupPrivilegeValue(null, privilege, ref tp.Luid);
+        retVal = AdjustTokenPrivileges(htok, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+        return retVal;
+    }
+}
+'@
+
+        $ProcessHandle = (Get-Process -Id $PID).Handle
+        (Add-Type $Definition -PassThru)[0]::EnablePrivilege($ProcessHandle, $Privilege, $Disable)
+    }
+
+    $AdminFullControl = [System.Security.AccessControl.RegistryAccessRule]::new('BUILTIN\Administrators', 'FullControl', 'ContainerInherit', 'None', 'Allow')
+    $AdministratorsGroup = [System.Security.Principal.NTAccount]::new('BUILTIN\Administrators')
     function WriteRegValues {
         param (
             [hashtable]$RegPath
@@ -133,7 +213,48 @@ begin {
         if (-not (Test-Path $RegPath.Path)) { $null = New-Item -Path $RegPath.Path -Force }
         foreach ($RegValue in $RegPath.Values) {
             Set-ItemProperty -Path $RegPath.Path @RegValue -Force -ErrorAction:SilentlyContinue
-            if ($?) {
+            $Succeeded = $?
+            if (-not $Succeeded) {
+                Write-Host -ForegroundColor Yellow '        Registry write failed. Trying to grant full control to Administrators group...'
+                $RegHive = $RegHives[$RegPath.Path -replace '^(HK\w{1,2}):?\\.+', '$1']
+                $SubKey = $RegPath.Path -replace '^HK(?:LM|CU|U|CR|CC|PD):?\\'
+                try {
+                    # Use admin rights to take ownership of locked key for administrators
+                    $GotPrivilege = $false
+                    $Counter = 0
+                    while (-not $GotPrivilege -and $Counter -lt $MaxRegOperationAttempts) {
+                        $GotPrivilege = Enable-Privilege SeTakeOwnershipPrivilege
+                        Start-Sleep -Milliseconds 100
+                        $Counter++
+                    }
+                    if (-not $GotPrivilege) {
+                        throw 'Couldn''t get take ownership permission'
+                    }
+                    # Set administrators as owner
+                    $LockedKey = $RegHive.OpenSubKey($SubKey, 'ReadWriteSubTree', 'TakeOwnership')
+                    $KeyAcl = $LockedKey.GetAccessControl('None')
+                    $KeyAcl.SetOwner($AdministratorsGroup)
+                    $LockedKey.SetAccessControl($KeyAcl)
+                    # Grant administrators full control
+                    $KeyAcl = $LockedKey.GetAccessControl()
+                    $KeyAcl.SetAccessRule($AdminFullControl)
+                    $LockedKey.SetAccessControl($KeyAcl)
+                    $LockedKey.Close()
+                    # Set key values with new permissions
+                    $LockedKey = $RegHive.OpenSubKey($SubKey, 'ReadWriteSubTree', 'WriteKey')
+                    $LockedKey.SetValue($RegValue.Name, $RegValue.Value, $RegValue.Type)
+                    Start-Sleep 1
+                    $CheckValue = Get-ItemPropertyValue -Path $RegPath.Path -Name $RegValue.Name
+                    $Succeeded = ($CheckValue -eq $RegValue.Value)
+                } catch {
+                    Write-Host -ForegroundColor Red "        Couldn't open subkey '$SubKey' to change permissions"
+                    Write-Host -ForegroundColor Red "        Error: $($_.Exception.Message)"
+                } finally {
+                    # Release privilege after use
+                    $null = Enable-Privilege SeTakeOwnershipPrivilege -Disable
+                }
+            }
+            if ($Succeeded) {
                 Write-Host -ForegroundColor Green '        Registry Operation Succeeded'
             } else {
                 Write-Host -ForegroundColor Red '        Registry Operation Failed'
