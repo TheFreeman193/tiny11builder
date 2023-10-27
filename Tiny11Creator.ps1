@@ -8,7 +8,8 @@ param (
     [string]$Output = (Join-Path $PSScriptRoot 'tiny11.iso'),
     [int]$MaxRegOperationAttempts = 100,
     [int]$MaxImageOperationAttempts = 10,
-    [switch]$Cleanup
+    [switch]$Cleanup,
+    [switch]$PauseBetweenSteps
 )
 begin {
     Push-Location $PSScriptRoot -StackName Tiny11Creator
@@ -293,7 +294,7 @@ public class AdjPriv
         Write-Host -ForegroundColor Cyan "`nUnmount image '${Scratch}': Attempt 1/$MaxImageOperationAttempts" -NoNewline
         while ((-not [string]::IsNullOrWhiteSpace($ScratchInfo) -or (Test-Path $Scratch)) -and $Counter -le $MaxImageOperationAttempts) {
             Write-Host -ForegroundColor Gray ("`u{08}" * ($LastCounterLen + $MaxImageAttemptsStrLen) + $Counter.ToString() + "/$MaxImageOperationAttempts") -NoNewline
-            $ScratchInfo = dism /Get-MountedWimInfo | Select-String -SimpleMatch -Raw ("Mount Dir : $Scratch")
+            $ScratchInfo = dism /Get-MountedWimInfo | Select-String -SimpleMatch ("Mount Dir : $Scratch") | Select-Object -ExpandProperty Line
             dism.exe /Unmount-Image /MountDir:"${Scratch}" /Discard
             Start-Sleep 2
             dism.exe /Cleanup-MountPoints
@@ -388,7 +389,7 @@ public class AdjPriv
         } else {
             Write-Host -ForegroundColor Green "`nCleanup complete. Finished."
         }
-        Write-Host -ForegroundColor Magenta "`n`nPress Enter to exit the script..."
+        Write-Host -ForegroundColor Magenta "`n`nPress enter to exit the script..."
         $null = Read-Host
 
         Pop-Location -StackName Tiny11Creator
@@ -435,20 +436,6 @@ process {
                 return
             }
 
-            $Mount = Mount-DiskImage -ImagePath $Source -StorageType ISO -Access ReadOnly -PassThru
-            if (-not $? -or -not $Mount.Attached) {
-                Write-Error "Mounting ISO image '$Source' failed"
-                return
-            }
-            $SourceDrive = ($Mount | Get-Volume).DriveLetter, ':' -join ''
-
-
-            foreach ($SourceFile in $ImageFiles) {
-                if (-not (Test-Path (Join-Path $SourceDrive $SourceFile))) {
-                    Write-Error "Can't find Windows image file '$SourceFile' in drive letter $SourceDrive`n`nPlease enter the drive letter of a windows installation medium."
-                    return
-                }
-            }
             $ScratchDir = $ScratchDir.TrimEnd('\')
             $BuildDir = $BuildDir.TrimEnd('\')
 
@@ -470,14 +457,53 @@ process {
                 Write-Host -ForegroundColor Yellow "`nWill overwrite build directory."
             }
 
+            Write-Host -ForegroundColor Cyan "`nCreating build directory..."
             $null = New-Item -ItemType Directory -Path $BuildDir -Force
+            if (-not $?) {
+                Write-Error "Couldn't create directory '$BuildDir'. Stopping."
+                return
+            }
+            Write-Host -ForegroundColor Green "`nDirectory created."
+
+            Write-Host -ForegroundColor Cyan "`nCreating scratch directory..."
+            $null = New-Item -ItemType Directory -Path $ScratchDir -Force
+            if (-not $?) {
+                Write-Error "Couldn't create directory '$ScratchDir'. Stopping."
+                return
+            }
+            Write-Host -ForegroundColor Green "`nDirectory Created."
+
+            Write-Host -ForegroundColor Cyan "`nMounting source ISO image..."
+            $Mount = Mount-DiskImage -ImagePath $Source -StorageType ISO -Access ReadOnly -PassThru
+            if (-not $?) {
+                Write-Error "Mounting ISO image '$Source' failed. Stopping."
+                return
+            }
+            $SourceDrive = ($Mount | Get-Volume).DriveLetter, ':' -join ''
+            if ($SourceDrive -inotmatch '^[a-z]:$') {
+                Write-Error "Couldn't find mount point for ISO image '$Source'. Stopping."
+                return
+            }
+            Write-Host -ForegroundColor Green "`nImage mounted successfully."
+
+            foreach ($SourceFile in $ImageFiles) {
+                if (-not (Test-Path (Join-Path $SourceDrive $SourceFile))) {
+                    Write-Error "Can't find Windows image file '$SourceFile' in drive letter $SourceDrive`nPlease enter the drive letter of a windows installation medium."
+                    return
+                }
+            }
+
             Write-Host -ForegroundColor Cyan "`nCopying non-image Windows OS files from source..."
             $null = xcopy.exe /E /I /H /R /Y /J /Q /V /EXCLUDE:$(Join-Path $PSScriptRoot 'xcopy_excludes.txt') $SourceDrive $BuildDir *>&1
+            if (-not $?) {
+                Write-Error "Couldn't copy files from '$SourceDrive' to '$BuildDir'. Stopping."
+                return
+            }
             Write-Host -ForegroundColor Green "`nCopy complete"
 
             Write-Host -ForegroundColor Cyan "`nGetting OS image (install.wim) information..."
             $ImageInfo = dism.exe /Get-ImageInfo /ImageFile:"${SourceDrive}\sources\install.wim"
-            $LastIndex = (($ImageInfo | Select-String 'Index : ' -Raw | Select-Object -Last 1) -replace 'Index : (\d+)', '$1') -as [uint16]
+            $LastIndex = $ImageInfo | Select-String 'Index : (\d+)' | Select-Object -Last 1 | ForEach-Object { $_.Matches[0].Groups[1].Value }
             if ($ImageIndex -lt 1) {
                 Write-Output $ImageInfo
                 Write-Host -ForegroundColor Magenta "`n`nSelect image index to use (1-$LastIndex): " -NoNewline
@@ -494,11 +520,14 @@ process {
             #endregion
 
             #region OS Install Image
-            Write-Host -ForegroundColor White "`nSection: Windows OS image (install.wim)"
-            Write-Host -ForegroundColor Cyan "`n`nMounting source Windows image (index $ImageIndex)... This may take a while.`n"
-            $null = New-Item -ItemType Directory -Path $ScratchDir -Force
-            dism.exe /Mount-Image /ImageFile:"${SourceDrive}\sources\install.wim" /index:$ImageIndex /MountDir:"${ScratchDir}" /ReadOnly
+            Write-Host -ForegroundColor White "`nSection: Windows OS image (install.wim)`n"
 
+            Write-Host -ForegroundColor Cyan "`nMounting source Windows image (index $ImageIndex)... This may take a while.`n"
+            dism.exe /Mount-Image /ImageFile:"${SourceDrive}\sources\install.wim" /index:$ImageIndex /MountDir:"${ScratchDir}" /ReadOnly
+            if (-not $?) {
+                Write-Error "Couldn't mount Windows OS image from $SourceDrive to '$ScratchDir'. Stopping."
+                return
+            }
             Write-Host -ForegroundColor Green "`nMounting complete."
 
             Write-Host -ForegroundColor Cyan "`nGetting list of UWP Apps (AppX packages) from image..."
@@ -541,6 +570,10 @@ process {
             Write-Host -ForegroundColor Green "`nRemoved OneDrive."
 
             Write-Host -ForegroundColor Green "`nFilesystem removals complete."
+            if ($PauseBetweenSteps) {
+                Write-Host -ForegroundColor Magenta "`nMake any additional OS image filesystem changes then`npress enter to continue..."
+                $null = Read-Host
+            }
 
             Write-Host -ForegroundColor Cyan "`nLoading OS image registry keys..."
             $null = reg.exe load HKLM\tiny11_DEFAULT "${ScratchDir}\Windows\System32\config\default"
@@ -558,8 +591,10 @@ process {
             }
 
             Write-Host -ForegroundColor Green "`nOS image registry changes complete."
-            Write-Host -ForegroundColor Magenta "`nIf desired, make any further changes to the OS image registry (under HKLM\tiny11_*)`nthen press Enter to continue..."
-            $null = Read-Host
+            if ($PauseBetweenSteps) {
+                Write-Host -ForegroundColor Magenta "`nMake any additional OS image registry changes (under HKLM\tiny11_*) then`npress enter to continue..."
+                $null = Read-Host
+            }
 
             Write-Host -ForegroundColor Cyan "`nUnloading OS image registry keys... This may take many attempts."
             $null = UnmountRegKey 'HKLM:\tiny11_DEFAULT'
@@ -593,10 +628,16 @@ process {
 
             Write-Host -ForegroundColor Cyan "`nCreating scratch directory"
             $null = New-Item -ItemType Directory -Path $ScratchDir -Force
+            Write-Host -ForegroundColor Green "`nDirectory created."
 
             Write-Host -ForegroundColor Cyan "`nMounting boot image..."
             dism.exe /Mount-Image /ImageFile:"${SourceDrive}\sources\boot.wim" /index:2 /MountDir:"${ScratchDir}" /ReadOnly
             Write-Host -ForegroundColor Green "`nMounting complete."
+
+            if ($PauseBetweenSteps) {
+                Write-Host -ForegroundColor Magenta "`nMake any additional boot image filesystem changes then`npress enter to continue..."
+                $null = Read-Host
+            }
 
             Write-Host -ForegroundColor Cyan "`nLoading boot image registry keys..."
             $null = reg.exe load HKLM\tiny11_DEFAULT "${ScratchDir}\Windows\System32\config\default"
@@ -609,8 +650,11 @@ process {
             }
 
             Write-Host -ForegroundColor Green "`nBoot image registry changes complete."
-            Write-Host -ForegroundColor Magenta "`nIf desired, make any further changes to the boot image registry (under HKLM\tiny11_*)`nthen press Enter to continue..."
-            $null = Read-Host
+
+            if ($PauseBetweenSteps) {
+                Write-Host -ForegroundColor Magenta "`nMake any additional boot image registry changes (under HKLM\tiny11_*) then`npress enter to continue..."
+                $null = Read-Host
+            }
 
             Write-Host -ForegroundColor Cyan "`nUnloading boot image registry... This may take many attempts."
             $null = UnmountRegKey 'HKLM:\tiny11_DEFAULT'
@@ -633,6 +677,11 @@ process {
             Write-Host -ForegroundColor Cyan "`nUnmounting source boot image... This may take a while."
             $null = UnmountImage $ScratchDir
             Write-Host -ForegroundColor Green "`nFinished unmounting source boot image."
+
+            if ($PauseBetweenSteps) {
+                Write-Host -ForegroundColor Magenta "`nMake any additional install directory changes then`npress enter to continue..."
+                $null = Read-Host
+            }
             #endregion
 
             #region Build ISO
