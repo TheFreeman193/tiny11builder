@@ -243,6 +243,7 @@ public class AdjPriv
                     # Set key values with new permissions
                     $LockedKey = $RegHive.OpenSubKey($SubKey, 'ReadWriteSubTree', 'WriteKey')
                     $LockedKey.SetValue($RegValue.Name, $RegValue.Value, $RegValue.Type)
+                    $LockedKey.Close()
                     Start-Sleep 1
                     $CheckValue = Get-ItemPropertyValue -Path $RegPath.Path -Name $RegValue.Name
                     $Succeeded = ($CheckValue -eq $RegValue.Value)
