@@ -371,8 +371,10 @@ public class AdjPriv
             Write-Warning "Couldn't clean up build directory '$BuildDir'. You may have to manually remove remaining temporary files."
         }
 
-        Write-Host -ForegroundColor Cyan "`nLooking for mounted source ISO..."
-        if (-not (UnmountIso $Source)) { $Dirty = $true }
+        if ($script:IsIso) {
+            Write-Host -ForegroundColor Cyan "`nLooking for mounted source ISO..."
+            if (-not (UnmountIso $Source)) { $Dirty = $true }
+        }
 
         if ($Dirty) {
             Write-Host -ForegroundColor Red 'Cleanup was incomplete. Try running the script in cleanup mode:'
@@ -412,6 +414,9 @@ public class AdjPriv
     $Arch = $ArchMap[$env:PROCESSOR_ARCHITECTURE]
     if ([string]::IsNullOrWhiteSpace($ArchDir)) { $Arch = 'x86' }
     $OSCDImgPath = Join-Path $PSScriptRoot "oscdimg_$Arch.exe"
+
+    $ISOSig = '67,68,48,48,49'
+    $IsoCheckOffsets = @(0x8001, 0x8801, 0x9001)
 }
 
 process {
@@ -431,8 +436,27 @@ process {
             Write-Host -ForegroundColor Magenta 'Input needed'
             Write-Host ''
 
-            if (-not (Test-Path $Source -PathType Leaf)) {
-                Write-Error "Source ISO '$Source' not found"
+            $script:IsIso = $false
+            $script:IsDir = $false
+            if ($Source -imatch '^[a-z]$') { $Source = "${Source}:\" }
+            if (Test-Path $Source -PathType Leaf) {
+                $FileSm = [System.IO.File]::OpenRead((Get-Item $Source).FullName)
+                $FirstBytes = [byte[]]::new(5)
+                $CurOffset = 0
+                while (-not $script:IsIso -and $CurOffset -lt $IsoCheckOffsets.Count) {
+                    [void]$FileSm.Seek($IsoCheckOffsets[$CurOffset], [System.IO.SeekOrigin]::Begin)
+                    [void]$FileSm.Read($FirstBytes)
+                    if (($FirstBytes -join ',') -ieq $ISOSig) {
+                        $script:IsIso = $true
+                    }
+                    $CurOffset++
+                }
+                $FileSm.Close()
+            } elseif (Test-Path $Source -PathType Container) {
+                $script:IsDir = $true
+            }
+            if (-not $script:IsIso -and -not $script:IsDir) {
+                Write-Error "No valid ISO or installation partition found at '$Source'"
                 return
             }
 
@@ -473,22 +497,30 @@ process {
             }
             Write-Host -ForegroundColor Green "`nDirectory Created."
 
-            Write-Host -ForegroundColor Cyan "`nMounting source ISO image..."
-            $Mount = Mount-DiskImage -ImagePath $Source -StorageType ISO -Access ReadOnly -PassThru
-            if (-not $?) {
-                Write-Error "Mounting ISO image '$Source' failed. Stopping."
-                return
+            if ($script:IsIso) {
+                Write-Host -ForegroundColor Cyan "`nMounting source ISO image..."
+                $Mount = Mount-DiskImage -ImagePath $Source -StorageType ISO -Access ReadOnly -PassThru
+                if (-not $?) {
+                    Write-Error "Mounting ISO image '$Source' failed. Stopping."
+                    return
+                }
+                $SourceDrive = ($Mount | Get-Volume).DriveLetter, ':\' -join ''
+                if ($SourceDrive -inotmatch '^[a-z]:\\$') {
+                    Write-Error "Couldn't find mount point for ISO image '$Source'. Stopping."
+                    return
+                }
+                if (-not (Test-Path $SourceDrive -PathType Container)) {
+                    Write-Error "Couldn't access mount point for ISO image '$Source'. Stopping."
+                    return
+                }
+                Write-Host -ForegroundColor Green "`nImage mounted successfully."
+            } else {
+                $SourceDrive = $Source
             }
-            $SourceDrive = ($Mount | Get-Volume).DriveLetter, ':' -join ''
-            if ($SourceDrive -inotmatch '^[a-z]:$') {
-                Write-Error "Couldn't find mount point for ISO image '$Source'. Stopping."
-                return
-            }
-            Write-Host -ForegroundColor Green "`nImage mounted successfully."
 
             foreach ($SourceFile in $ImageFiles) {
                 if (-not (Test-Path (Join-Path $SourceDrive $SourceFile))) {
-                    Write-Error "Can't find Windows image file '$SourceFile' in drive letter $SourceDrive`nPlease enter the drive letter of a windows installation medium."
+                    Write-Error "Can't find Windows image file '$SourceFile' in drive letter $SourceDrive`nPlease enter the drive letter or ISO of a windows installation medium."
                     return
                 }
             }
@@ -687,9 +719,11 @@ process {
             #region Build ISO
             Write-Host -ForegroundColor White "`nSection: Create new ISO`n"
 
-            Write-Host -ForegroundColor Cyan "`nUnmounting source ISO..."
-            $null = UnmountIso $Mount
-            Write-Host -ForegroundColor Green "`nFinished unmounting source ISO."
+            if ($script:IsIso) {
+                Write-Host -ForegroundColor Cyan "`nUnmounting source ISO..."
+                $null = UnmountIso $Mount
+                Write-Host -ForegroundColor Green "`nFinished unmounting source ISO."
+            }
 
             Write-Host -ForegroundColor Cyan "`nCopying unattend file to bypass Microsoft account requirements"
             Copy-Item (Join-Path $PSScriptRoot 'autounattend.xml') "${BuildDir}\autounattend.xml"
@@ -723,7 +757,7 @@ process {
             break ProcessSection
         }
     } catch {
-        Write-Host -ForegroundColor Red 'Script failed or was terminated'
+        Write-Host -ForegroundColor Red "Script failed or was terminated`nMessage: $($_.Exception.Message)"
     } finally {
         DoCleanup
     }
