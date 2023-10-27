@@ -396,6 +396,21 @@ public class AdjPriv
 
         $script:DidCleanup = $true
     }
+
+    # Windows ADK ISO authoring tool platform selection
+    $ArchMap = @{
+        'AMD64'   = 'amd64'
+        'ARM64'   = 'arm64'
+        'ARM'     = 'arm'
+        'INTEL'   = 'x86'
+        'x86'     = 'x86'
+        'IA64'    = 'amd64'
+        'EM64T'   = 'amd64'
+        'UNKNOWN' = 'x86'
+    }
+    $Arch = $ArchMap[$env:PROCESSOR_ARCHITECTURE]
+    if ([string]::IsNullOrWhiteSpace($ArchDir)) { $Arch = 'x86' }
+    $OSCDImgPath = Join-Path $PSScriptRoot "oscdimg_$Arch.exe"
 }
 
 process {
@@ -632,8 +647,26 @@ process {
             Write-Host -ForegroundColor Green "`nCopy complete."
 
             Write-Host -ForegroundColor Cyan "`nBuilding new ISO image..."
-            & (Join-Path $PSScriptRoot 'oscdimg.exe') -m -o -u2 -udfver102 "-bootdata:2#p0,e,b${BuildDir}\boot\etfsboot.com#pEF,e,b${BuildDir}\efi\microsoft\boot\efisys.bin" ${BuildDir} $Output
-            Write-Host -ForegroundColor Green "`nISO build complete."
+
+            if (-not (Test-Path $OSCDImgPath -PathType Leaf)) {
+                Write-Error "Couldn't find the Windows ADK ISO authoring tool. You will need to build the ISO yourself."
+                Write-Host -ForegroundColor White (
+                    "`nYou can download the Windows ADK from microsoft: https://learn.microsoft.com/en-us/windows-hardware/get-started/adk-install" +
+                    "`nSelect 'Deployment Tools' in the installer wizard." +
+                    "`nThe ISO authoring tool can then be found at:"
+                )
+                Write-Host -ForegroundColor Gray "`nC:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\<YOUR_ARCH>\Oscdimg\oscdimg.exe"
+                Write-Host -ForegroundColor White "`nWhere <YOUR_ARCH> is either 'amd64', 'x86', 'arm64', or 'arm'. Find your architecture with the command:"
+                Write-Host -ForegroundColor Gray "`ncmd.exe /c echo %PROCESSOR_ARCHITECTURE%"
+                Write-Host -ForegroundColor White "`nOnce you have the correct OSCDIMG.exe executable, you can use the following command:"
+                Write-Host -ForegroundColor Gray "`noscdimg.exe -m -o -u2 -udfver102 -bootdata:""2#p0,e,b${BuildDir}\boot\etfsboot.com#pEF,e,b${BuildDir}\efi\microsoft\boot\efisys.bin"" ""${BuildDir}"" ""$Output"""
+                Write-Host -ForegroundColor White "`nOnce the ISO is built, press enter and the script will proceed to the cleanup phase."
+                Write-Host -ForegroundColor Magenta "`n`nPress enter to continue..."
+                $null = Read-Host
+            } else {
+                & $OSCDImgPath -m -o -u2 -udfver102 -bootdata:"2#p0,e,b${BuildDir}\boot\etfsboot.com#pEF,e,b${BuildDir}\efi\microsoft\boot\efisys.bin" ${BuildDir} $Output
+                Write-Host -ForegroundColor Green "`nISO build complete."
+            }
 
             Write-Host -ForegroundColor Green "`n`ntiny11 image creation finished."
             #endregion
